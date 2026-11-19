@@ -247,4 +247,19 @@ describe('FoundryDataAccess.createWorldItems by compendium uuid', () => {
     expect(options).toMatchObject({ keepId: true });
     expect(result.created[0].sourceUuid).toBe(FEAT_UUID);
   });
+
+  it('puts a world copy in the named folder, not the pack one', async () => {
+    stubFoundry({ [FEAT_UUID]: makeSource(FEAT_UUID, choiceFeat) });
+    (globalThis as any).game.folders = [{ type: 'Item', name: 'Loot', id: 'lootFolderId0001' }];
+    const createDocuments = stubItemClass();
+
+    await makeDataAccess(null).createWorldItems({
+      items: [{ compendiumUuid: FEAT_UUID }],
+      folder: 'Loot',
+    });
+
+    const [payload, options] = createDocuments.mock.calls[0];
+    expect(payload[0].folder).toBe('lootFolderId0001');
+    expect(options).toMatchObject({ keepId: true });
+  });
 });
