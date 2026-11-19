@@ -69,6 +69,11 @@ export class CompendiumTools {
               type: 'string',
               description: 'Optional filter by pack type (e.g., "Item", "Actor", "JournalEntry")',
             },
+            packId: {
+              type: 'string',
+              description:
+                'Optional pack id from list-compendium-packs (e.g., "pf2e.spells-srd"): searches only that pack. Use it when a short name is shared by many packs.',
+            },
             filters: {
               type: 'object',
               description:
@@ -362,6 +367,7 @@ export class CompendiumTools {
     const schema = z.object({
       query: z.string().min(2, 'Search query must be at least 2 characters'),
       packType: z.string().optional(),
+      packId: z.string().min(1).optional(),
       filters: GenericFiltersSchema.optional(),
       limit: z.number().min(1).max(50).default(50),
     });
@@ -392,7 +398,7 @@ export class CompendiumTools {
       }
     }
 
-    const { query, packType, filters, limit } = parsedArgs;
+    const { query, packType, packId, filters, limit } = parsedArgs;
 
     // Log system detection and filters
     this.logger.info('Compendium search with system detection', {
@@ -405,6 +411,7 @@ export class CompendiumTools {
       const results = await this.foundryClient.query('foundry-mcp-bridge.searchCompendium', {
         query,
         packType,
+        packId,
         filters,
       });
 
@@ -836,6 +843,7 @@ export class CompendiumTools {
   private formatCompendiumItem(item: any, gameSystem?: GameSystem): any {
     const formatted: any = {
       id: item.id,
+      uuid: item.uuid,
       name: item.name,
       type: item.type,
       pack: {

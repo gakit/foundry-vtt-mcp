@@ -84,6 +84,8 @@ interface CharacterEffect {
 
 interface CompendiumSearchResult {
   id: string;
+  /** `Compendium.<pack>.<documentType>.<id>`, absent when the entry has no id. */
+  uuid?: string;
   name: string;
   type: string;
   img?: string;
@@ -93,6 +95,11 @@ interface CompendiumSearchResult {
   summary?: string;
   hasImage?: boolean;
   description?: string;
+}
+
+/** Builds the UUID of a compendium entry, the form `fromUuid` and `add-to-actor` accept. */
+function compendiumEntryUuid(packId: string, documentType: string, entryId: string): string {
+  return `Compendium.${packId}.${documentType}.${entryId}`;
 }
 
 // D&D 5e Enhanced Creature Index
@@ -2824,6 +2831,26 @@ export class FoundryDataAccess {
   }
 
   /**
+   * Throws when `packId` names no pack, a Scene pack (never searched), or a pack
+   * whose document type contradicts `packType`. A search limited to such a pack
+   * would otherwise return an empty list the caller can't tell from "no match".
+   */
+  private assertSearchablePack(packId: string, packType?: string): void {
+    const pack = game.packs.get(packId);
+    if (!pack) {
+      throw new Error(`Unknown compendium pack: ${packId}`);
+    }
+
+    const type = pack.metadata.type;
+    if (type === 'Scene') {
+      throw new Error(`Pack ${packId} is a Scene pack; scene packs are not searchable`);
+    }
+    if (packType && type !== packType) {
+      throw new Error(`Pack ${packId} holds ${type}, not ${packType}`);
+    }
+  }
+
+  /**
    * Search compendium packs for items matching query with optional filters
    */
   async searchCompendium(
@@ -2836,11 +2863,16 @@ export class FoundryDataAccess {
       alignment?: string;
       hasLegendaryActions?: boolean;
       spellcaster?: boolean;
-    }
+    },
+    packId?: string
   ): Promise<CompendiumSearchResult[]> {
     // Add defensive checks for query parameter
     if (!query || typeof query !== 'string' || query.trim().length < 2) {
       throw new Error('Search query must be a string with at least 2 characters');
+    }
+
+    if (packId) {
+      this.assertSearchablePack(packId, packType);
     }
 
     // ENHANCED SEARCH: If we have creature-specific filters and Actor packType, use enhanced index
@@ -2862,17 +2894,25 @@ export class FoundryDataAccess {
           if (filters.size) criteria.size = filters.size;
           if (filters.hasLegendaryActions)
             criteria.hasLegendaryActions = filters.hasLegendaryActions;
+          if (packId) criteria.packId = packId;
 
           const enhancedResult = await this.listCreaturesByCriteria(criteria);
 
           // No name filtering needed - trust the enhanced creature index!
-          const filteredResults = enhancedResult.creatures;
+          // The pack filter is repeated here because the basic fallback inside
+          // listCreaturesByCriteria does not apply criteria.packId.
+          const filteredResults = enhancedResult.creatures.filter(
+            creature => !packId || creature.pack === packId
+          );
 
           // Convert to CompendiumSearchResult format
           return filteredResults.map(
             creature =>
               ({
                 id: creature.id || creature.name,
+                ...(creature.id
+                  ? { uuid: compendiumEntryUuid(creature.pack, 'Actor', creature.id) }
+                  : {}),
                 name: creature.name,
                 type: creature.type || 'npc',
                 pack: creature.pack,
@@ -2914,6 +2954,9 @@ export class FoundryDataAccess {
 
     // Filter packs by type if specified
     const packs = Array.from(game.packs.values()).filter(pack => {
+      if (packId && pack.metadata.id !== packId) {
+        return false;
+      }
       if (packType && pack.metadata.type !== packType) {
         return false;
       }
@@ -3011,6 +3054,15 @@ export class FoundryDataAccess {
               // Standard index entry result
               results.push({
                 id: typedEntry._id || '',
+                ...(typedEntry._id
+                  ? {
+                      uuid: compendiumEntryUuid(
+                        pack.metadata.id,
+                        pack.metadata.type,
+                        typedEntry._id
+                      ),
+                    }
+                  : {}),
                 name: typedEntry.name,
                 type: typedEntry.type || 'unknown',
                 img: typedEntry.img || undefined,
@@ -3249,6 +3301,8 @@ export class FoundryDataAccess {
     hasSpells?: boolean;
     hasLegendaryActions?: boolean;
     limit?: number;
+    /** Keeps only creatures from this pack, applied before the limit. */
+    packId?: string;
   }): Promise<{ creatures: any[]; searchSummary: any }> {
     const limit = criteria.limit || 500;
 
@@ -3264,8 +3318,10 @@ export class FoundryDataAccess {
       const enhancedCreatures = await this.persistentIndex.getEnhancedIndex();
 
       // Apply filters to enhanced data
-      let filteredCreatures = enhancedCreatures.filter(creature =>
-        this.passesEnhancedCriteria(creature, criteria)
+      let filteredCreatures = enhancedCreatures.filter(
+        creature =>
+          (!criteria.packId || creature.pack === criteria.packId) &&
+          this.passesEnhancedCriteria(creature, criteria)
       );
 
       // Sort by power level then name for consistent ordering (system-aware).

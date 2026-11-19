@@ -306,6 +306,7 @@ export class QueryHandlers {
   private async handleSearchCompendium(data: {
     query: string;
     packType?: string;
+    packId?: string;
     filters?: {
       challengeRating?: number | { min?: number; max?: number };
       creatureType?: string;
@@ -333,7 +334,12 @@ export class QueryHandlers {
         throw new Error('query parameter is required and must be a string');
       }
 
-      return await this.dataAccess.searchCompendium(data.query, data.packType, data.filters);
+      return await this.dataAccess.searchCompendium(
+        data.query,
+        data.packType,
+        data.filters,
+        data.packId
+      );
     } catch (error) {
       throw new Error(
         `Failed to search compendium: ${error instanceof Error ? error.message : 'Unknown error'}`
