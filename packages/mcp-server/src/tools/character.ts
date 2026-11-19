@@ -11,6 +11,55 @@ export interface CharacterToolsOptions {
   systemRegistry?: SystemRegistry;
 }
 
+const INLINE_ITEM_FIELDS = ['name', 'type', 'img', 'system', 'effects', 'flags'] as const;
+
+/**
+ * One entry of a world-item create or an add-to-actor: a compendium copy
+ * (`compendiumUuid`, `overrides`, `selections`) or inline data (`name`,
+ * `type`, ...). A single object rather than a union, so that a mixed or
+ * misplaced field is rejected with a plain message instead of being stripped.
+ */
+const itemEntrySchema = z
+  .object({
+    compendiumUuid: z.string().min(1, 'compendiumUuid cannot be empty').optional(),
+    overrides: z.record(z.any()).optional(),
+    selections: z.record(z.unknown()).optional(),
+    name: z.string().min(1, 'Item name cannot be empty').optional(),
+    type: z.string().min(1, 'Item type cannot be empty').optional(),
+    img: z.string().optional(),
+    system: z.record(z.any()).optional(),
+    effects: z.array(z.record(z.any())).optional(),
+    flags: z.record(z.any()).optional(),
+  })
+  .superRefine((entry, ctx) => {
+    if (entry.compendiumUuid !== undefined) {
+      if (INLINE_ITEM_FIELDS.some(field => entry[field] !== undefined)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'use compendiumUuid or name+type, not both; use "overrides" to change a compendium item',
+        });
+      }
+      return;
+    }
+
+    if (entry.overrides !== undefined || entry.selections !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'overrides/selections need compendiumUuid; on an inline item set system.rules[n].selection',
+      });
+      return;
+    }
+
+    if (entry.name === undefined || entry.type === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'needs compendiumUuid, or name and type',
+      });
+    }
+  });
+
 export class CharacterTools {
   private foundryClient: FoundryClient;
   private logger: Logger;
@@ -145,11 +194,11 @@ export class CharacterTools {
         name: 'manage-world-items',
         description:
           'Manage Item documents in Foundry VTT. Specify the operation with "action":\n' +
-          '- "create": Create world-level Items in the sidebar (not actor-attached). Good for reusable libraries. GM-only.\n' +
+          '- "create": Create world-level Items in the sidebar (not actor-attached), inline or copied from a compendium entry by compendiumUuid. Good for reusable libraries. GM-only.\n' +
           '- "list": List world-level Items with optional type/folder/name filters. Returns names and ids only.\n' +
           '- "get": Read one world-level Item in full (description, system data, rules) by itemIdentifier (id or exact name). GM-only.\n' +
           '- "update": Update existing world-level Items by ID. GM-only.\n' +
-          '- "add-to-actor": Create and attach Items directly to an existing actor. GM-only.\n' +
+          '- "add-to-actor": Create and attach Items directly to an existing actor, inline or copied from a compendium entry by compendiumUuid (preferred: no need to read and retype the entry). GM-only.\n' +
           '- "remove-from-actor": Delete Items already on an actor, identified by itemIds and/or itemNames (optionally constrained by type). GM-only.\n' +
           '- "describe": Returns system-specific enum/schema reference for all item field values. ' +
           'Call this BEFORE creating or updating mgt2e items to get valid enum keys for fields like ' +
@@ -176,11 +225,28 @@ export class CharacterTools {
               type: 'array',
               minItems: 1,
               description:
-                'Required for "create" and "add-to-actor". One or more items to create. Each item requires a name and a type valid for the active game system (e.g. "action", "talent", "weapon"). For Cosmere RPG add-to-actor, pass system-specific data via the "system" field.',
+                'Required for "create" and "add-to-actor". One or more items to create. Each item is EITHER a compendium copy { compendiumUuid, overrides?, selections? } OR inline data { name, type, img?, system?, effects?, flags? }, never both. Prefer compendiumUuid (the "uuid" of a search-compendium hit) over reading an entry and retyping its system data. For Cosmere RPG add-to-actor inline items, pass system-specific data via the "system" field. A ChoiceSet rule left without a selection (PF2e) fails the whole call, nothing created, with each unanswered choice listed (key, prompt, choices); predicate-gated ChoiceSets are listed too. A ChoiceSet on an item granted by an added item can still open a dialog in Foundry.',
               items: {
                 type: 'object',
                 properties: {
-                  name: { type: 'string', description: 'Display name of the item' },
+                  compendiumUuid: {
+                    type: 'string',
+                    description:
+                      'Compendium entry to copy, e.g. "Compendium.pf2e.feats-srd.Item.<id>". Keeps its rules, effects, flags and compendium link.',
+                  },
+                  overrides: {
+                    type: 'object',
+                    description:
+                      'Compendium items only. Deep-merged onto the copy: objects merge, arrays are replaced whole, {"-=key": null} deletes a key. Answer ChoiceSets with "selections" rather than resending system.rules.',
+                    additionalProperties: true,
+                  },
+                  selections: {
+                    type: 'object',
+                    description:
+                      'Compendium items only. Answers ChoiceSet rules: { "<key>": <value> }, where key is the rule\'s "flag", or "#<index in system.rules>" when it has none, and value is one of its listed choice values (matched exactly, so 2 is not "2").',
+                    additionalProperties: true,
+                  },
+                  name: { type: 'string', description: 'Inline items: display name of the item' },
                   type: {
                     type: 'string',
                     description:
@@ -196,8 +262,17 @@ export class CharacterTools {
                       "System-specific data (free-form). Passed through to Foundry's DataModel layer.",
                     additionalProperties: true,
                   },
+                  effects: {
+                    type: 'array',
+                    description: 'Inline items: embedded ActiveEffect data.',
+                    items: { type: 'object', additionalProperties: true },
+                  },
+                  flags: {
+                    type: 'object',
+                    description: 'Inline items: document flags (e.g. { "pf2e": { ... } }).',
+                    additionalProperties: true,
+                  },
                 },
-                required: ['name', 'type'],
               },
             },
             updates: {
@@ -496,16 +571,9 @@ export class CharacterTools {
   }
 
   async handleAddActorItems(args: any): Promise<any> {
-    const itemSchema = z.object({
-      name: z.string().min(1, 'Item name cannot be empty'),
-      type: z.string().min(1, 'Item type cannot be empty'),
-      img: z.string().optional(),
-      system: z.record(z.any()).optional(),
-    });
-
     const schema = z.object({
       actorIdentifier: z.string().min(1, 'Actor identifier cannot be empty'),
-      items: z.array(itemSchema).min(1, 'At least one item is required'),
+      items: z.array(itemEntrySchema).min(1, 'At least one item is required'),
     });
 
     const { actorIdentifier, items } = schema.parse(args);
@@ -513,7 +581,7 @@ export class CharacterTools {
     this.logger.info('Adding items to actor', {
       actorIdentifier,
       count: items.length,
-      types: items.map(i => i.type),
+      types: items.map(i => i.compendiumUuid ?? i.type),
     });
 
     try {
@@ -628,17 +696,8 @@ export class CharacterTools {
   }
 
   async handleCreateWorldItems(args: any): Promise<any> {
-    const itemSchema = z.object({
-      name: z.string().min(1, 'Item name cannot be empty'),
-      type: z.string().min(1, 'Item type cannot be empty'),
-      img: z.string().optional(),
-      system: z.record(z.any()).optional(),
-      effects: z.array(z.record(z.any())).optional(),
-      flags: z.record(z.any()).optional(),
-    });
-
     const schema = z.object({
-      items: z.array(itemSchema).min(1, 'At least one item is required'),
+      items: z.array(itemEntrySchema).min(1, 'At least one item is required'),
       folder: z.string().optional(),
     });
 
@@ -647,7 +706,7 @@ export class CharacterTools {
     this.logger.info('Creating world items', {
       count: items.length,
       folder: folder ?? null,
-      types: items.map(i => i.type),
+      types: items.map(i => i.compendiumUuid ?? i.type),
     });
 
     try {
