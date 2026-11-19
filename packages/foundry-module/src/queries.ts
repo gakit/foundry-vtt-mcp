@@ -1,5 +1,5 @@
 import { MODULE_ID } from './constants.js';
-import { FoundryDataAccess } from './data-access.js';
+import { FoundryDataAccess, type ItemEntryInput } from './data-access.js';
 import { ComfyUIManager } from './comfyui-manager.js';
 import { guardQueryHandler } from './query-guard.js';
 
@@ -1767,12 +1767,7 @@ export class QueryHandlers {
 
   private async handleAddActorItems(data: {
     actorIdentifier: string;
-    items: Array<{
-      name: string;
-      type: string;
-      img?: string;
-      system?: Record<string, any>;
-    }>;
+    items: ItemEntryInput[];
   }): Promise<any> {
     try {
       // SECURITY: Silent GM validation - writes to actor sheets are GM-only
@@ -1914,12 +1909,7 @@ export class QueryHandlers {
   }
 
   private async handleCreateWorldItems(data: {
-    items: Array<{
-      name: string;
-      type: string;
-      img?: string;
-      system?: Record<string, any>;
-    }>;
+    items: ItemEntryInput[];
     folder?: string;
   }): Promise<any> {
     try {

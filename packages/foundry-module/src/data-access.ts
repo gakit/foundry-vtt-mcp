@@ -102,6 +102,161 @@ function compendiumEntryUuid(packId: string, documentType: string, entryId: stri
   return `Compendium.${packId}.${documentType}.${entryId}`;
 }
 
+/** An item given inline, as the data to create. */
+export type InlineItemEntry = {
+  name: string;
+  type: string;
+  img?: string;
+  system?: Record<string, any>;
+  effects?: Record<string, any>[];
+  flags?: Record<string, any>;
+};
+
+/**
+ * An item copied from a compendium entry. `overrides` is deep-merged onto the
+ * copy; `selections` answers its ChoiceSets, keyed as `choiceSetKey` says.
+ */
+export type CompendiumItemEntry = {
+  compendiumUuid: string;
+  overrides?: Record<string, any>;
+  selections?: Record<string, unknown>;
+};
+
+/** One entry of an item add: inline data or a compendium uuid. */
+export type ItemEntryInput = InlineItemEntry | CompendiumItemEntry;
+
+/*
+ * ChoiceSet handling works on the shape of `system.rules` (PF2e rule elements)
+ * and never checks the game system: items without such rules pass through.
+ */
+
+/** A ChoiceSet left without a selection, as reported to the caller. */
+type PendingChoice = { key: string; prompt: unknown; choices: unknown };
+
+/** Key a caller uses to answer a ChoiceSet: its `flag`, else `#<rule index>`. */
+function choiceSetKey(rule: any, index: number): string {
+  return typeof rule?.flag === 'string' && rule.flag.length > 0 ? rule.flag : `#${index}`;
+}
+
+function choiceSetRules(doc: Record<string, any>): Array<{ rule: any; index: number }> {
+  const rules = doc.system?.rules;
+  if (!Array.isArray(rules)) {
+    return [];
+  }
+
+  return rules
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ rule }) => rule?.key === 'ChoiceSet');
+}
+
+function localize(text: unknown): unknown {
+  if (typeof text !== 'string') {
+    return text;
+  }
+
+  return (game as any).i18n?.localize?.(text) ?? text;
+}
+
+/** The values a static `choices` array allows, or null when the choices are dynamic. */
+function staticChoiceValues(choices: unknown): unknown[] | null {
+  if (!Array.isArray(choices)) {
+    return null;
+  }
+
+  return choices.map(choice =>
+    choice !== null && typeof choice === 'object' ? (choice as any).value : choice
+  );
+}
+
+/**
+ * Set `selection` on the ChoiceSets named by `selections`. Throws when a key
+ * names no ChoiceSet, or when a value is not one of a static choice list
+ * (compared with `===`): PF2e would prompt again on a value it doesn't know.
+ */
+function applyChoiceSelections(
+  doc: Record<string, any>,
+  selections: Record<string, unknown>,
+  label: string
+): void {
+  const choiceSets = choiceSetRules(doc);
+
+  for (const [key, value] of Object.entries(selections)) {
+    const match = choiceSets.find(({ rule, index }) => choiceSetKey(rule, index) === key);
+    if (!match) {
+      const keys = choiceSets.map(({ rule, index }) => choiceSetKey(rule, index));
+      throw new Error(
+        `${label}: no ChoiceSet "${key}"; ChoiceSets: ${keys.length ? keys.join(', ') : 'none'}`
+      );
+    }
+
+    const allowed = staticChoiceValues(match.rule.choices);
+    if (allowed && !allowed.includes(value)) {
+      throw new Error(
+        `${label}: ${JSON.stringify(value)} is not a choice of "${key}"; valid: ${JSON.stringify(allowed)}`
+      );
+    }
+
+    match.rule.selection = value;
+  }
+}
+
+function findUnansweredChoices(doc: Record<string, any>): PendingChoice[] {
+  return choiceSetRules(doc)
+    .filter(({ rule }) => rule.selection === undefined || rule.selection === null)
+    .map(({ rule, index }) => ({
+      key: choiceSetKey(rule, index),
+      prompt: localize(rule.prompt ?? rule.label),
+      choices: Array.isArray(rule.choices)
+        ? rule.choices.map((choice: any) =>
+            choice !== null && typeof choice === 'object'
+              ? { value: choice.value, label: localize(choice.label) }
+              : { value: choice }
+          )
+        : rule.choices,
+    }));
+}
+
+/**
+ * Throw one error listing every unanswered ChoiceSet across `docs`, so the
+ * caller can answer them all in one retry. `labels` is parallel to `docs`.
+ */
+function assertChoicesAnswered(docs: Record<string, any>[], labels: string[]): void {
+  const lines = docs.flatMap((doc, i) => {
+    const pending = findUnansweredChoices(doc);
+    return pending.length ? [`${labels[i]}: ${JSON.stringify(pending)}`] : [];
+  });
+  if (lines.length === 0) {
+    return;
+  }
+
+  throw new Error(
+    'Unanswered ChoiceSet choices; nothing was created. Retry with "selections": { "<key>": <value> } ' +
+      'on each item (inline items: set system.rules[n].selection):\n' +
+      lines.join('\n')
+  );
+}
+
+/**
+ * Keep only the requested documents among those created, leaving out items a
+ * rule granted in the same call, whatever order they come back in.
+ */
+function summarizeRequested(
+  created: any[] | undefined,
+  requested: Map<string, string | null>
+): Array<{ id: string; name: string; type: string; sourceUuid?: string }> {
+  return (created || [])
+    .filter((doc: any) => requested.has(doc.id))
+    .map((doc: any) => {
+      const sourceUuid = requested.get(doc.id);
+      return {
+        id: doc.id,
+        name: doc.name,
+        type: doc.type,
+        ...(sourceUuid ? { sourceUuid } : {}),
+      };
+    });
+}
+
 // D&D 5e Enhanced Creature Index
 interface DnD5eCreatureIndex {
   id: string;
@@ -4875,31 +5030,128 @@ export class FoundryDataAccess {
   }
 
   /**
-   * Add one or more freshly-authored Item documents to an existing Actor.
+   * Build create-ready Item data from add entries, in index order.
    *
-   * Unlike `createActorFromCompendium*`, the items here are constructed from
-   * caller-supplied data — no compendium lookup. This is the path used to
-   * push planner-authored content (talents, actions, powers, custom gear)
-   * onto a PC or NPC sheet.
+   * An entry is either inline data (`name`, `type`, ...) or a `compendiumUuid`
+   * copied with Foundry's own `fromCompendium`, then changed by `overrides`
+   * and `selections`. Every entry is resolved and checked before anything is
+   * created, so the first bad entry throws and nothing is written. Each doc
+   * gets a fresh `_id`, recorded in `requested`, so callers creating with
+   * `keepId` can tell requested items from items a rule granted.
+   */
+  private async buildItemDocs(items: ItemEntryInput[]): Promise<{
+    docs: Record<string, any>[];
+    requested: Map<string, string | null>;
+    labels: string[];
+  }> {
+    // Discover the active system's declared Item types so we can give a
+    // useful error before sending the doc to Foundry's DataModel layer.
+    const itemDocTypes = (game as any).system?.documentTypes?.Item;
+    const validTypes: string[] | null =
+      itemDocTypes && typeof itemDocTypes === 'object' ? Object.keys(itemDocTypes) : null;
+
+    const docs: Record<string, any>[] = [];
+    const requested = new Map<string, string | null>();
+    const labels: string[] = [];
+
+    for (const [idx, entry] of items.entries()) {
+      if (!entry || typeof entry !== 'object') {
+        throw new Error(`items[${idx}]: entry must be an object`);
+      }
+
+      let doc: Record<string, any>;
+      let sourceUuid: string | null = null;
+      if ('compendiumUuid' in entry) {
+        sourceUuid = entry.compendiumUuid;
+        doc = await this.copyCompendiumItem(entry, idx);
+      } else {
+        doc = { name: entry.name, type: entry.type };
+        if (entry.img) doc.img = entry.img;
+        if (entry.system && typeof entry.system === 'object') doc.system = entry.system;
+        if (Array.isArray(entry.effects)) doc.effects = entry.effects;
+        if (entry.flags && typeof entry.flags === 'object') doc.flags = entry.flags;
+      }
+
+      if (typeof doc.name !== 'string' || doc.name.trim().length === 0) {
+        throw new Error(`items[${idx}]: "name" is required and must be a non-empty string`);
+      }
+      if (typeof doc.type !== 'string' || doc.type.trim().length === 0) {
+        throw new Error(`items[${idx}] ("${doc.name}"): "type" is required`);
+      }
+      if (validTypes && !validTypes.includes(doc.type)) {
+        throw new Error(
+          `items[${idx}] ("${doc.name}"): unknown type "${doc.type}" for system "${(game.system as any)?.id}". ` +
+            `Valid Item types: ${validTypes.join(', ')}`
+        );
+      }
+
+      // Assigned last so an override can't set it.
+      doc._id = foundry.utils.randomID();
+      requested.set(doc._id, sourceUuid);
+      docs.push(doc);
+      labels.push(`items[${idx}] ("${doc.name}"${sourceUuid ? `, ${sourceUuid}` : ''})`);
+    }
+
+    return { docs, requested, labels };
+  }
+
+  /**
+   * Copy a compendium Item for creation, then apply the entry's `overrides`
+   * (deep merge, arrays replaced whole, `{"-=key": null}` deletes) and its
+   * ChoiceSet `selections`.
+   */
+  private async copyCompendiumItem(
+    entry: CompendiumItemEntry,
+    idx: number
+  ): Promise<Record<string, any>> {
+    const uuidResolver = (globalThis as any).fromUuid;
+    if (typeof uuidResolver !== 'function') {
+      throw new Error('fromUuid unavailable');
+    }
+
+    const label = `items[${idx}] ("${entry.compendiumUuid}")`;
+    const source = await uuidResolver(entry.compendiumUuid);
+    if (!source) {
+      throw new Error(`${label}: compendium entry not found`);
+    }
+    if (source.documentName !== 'Item') {
+      throw new Error(`${label}: is a ${source.documentName}, not an Item`);
+    }
+    if (!source.pack) {
+      throw new Error(`${label}: not a compendium entry`);
+    }
+
+    const doc: Record<string, any> = (game as any).items.fromCompendium(source);
+    // fromCompendium can keep the pack's folder id, which doesn't exist in the world.
+    delete doc.folder;
+
+    if (entry.overrides) {
+      foundry.utils.mergeObject(doc, entry.overrides, { inplace: true, performDeletions: true });
+    }
+    if (entry.selections) {
+      applyChoiceSelections(doc, entry.selections, `items[${idx}] ("${doc.name}")`);
+    }
+    return doc;
+  }
+
+  /**
+   * Add Items to an existing Actor: inline data, or compendium entries by uuid.
    *
    * Validation is intentionally light: name + type are required, and the
    * type is checked against the active system's declared Item document
    * types when available. Everything else (system schema validation,
    * required sub-fields) is delegated to Foundry's DataModel layer, which
    * will fill defaults or throw a meaningful error.
+   *
+   * A ChoiceSet rule left without a selection would open a dialog in Foundry
+   * that blocks this call until it times out, so any such rule fails the whole
+   * call with the choices to answer, and nothing is created. `created` lists
+   * only the requested items, not the ones their rules granted.
    */
-  async addActorItems(params: {
-    actorIdentifier: string;
-    items: Array<{
-      name: string;
-      type: string;
-      img?: string;
-      system?: Record<string, any>;
-    }>;
-  }): Promise<{
+  async addActorItems(params: { actorIdentifier: string; items: ItemEntryInput[] }): Promise<{
     actorId: string;
     actorName: string;
-    created: Array<{ id: string; name: string; type: string }>;
+    created: Array<{ id: string; name: string; type: string; sourceUuid?: string }>;
   }> {
     this.validateFoundryState();
 
@@ -4917,43 +5169,16 @@ export class FoundryDataAccess {
       throw new Error(`Actor not found: ${actorIdentifier}`);
     }
 
-    // Discover the active system's declared Item types so we can give a
-    // useful error before sending the doc to Foundry's DataModel layer.
-    const itemDocTypes = (game as any).system?.documentTypes?.Item;
-    const validTypes: string[] | null =
-      itemDocTypes && typeof itemDocTypes === 'object' ? Object.keys(itemDocTypes) : null;
-
-    const payload = items.map((it, idx) => {
-      if (!it || typeof it.name !== 'string' || it.name.trim().length === 0) {
-        throw new Error(`items[${idx}]: "name" is required and must be a non-empty string`);
-      }
-      if (typeof it.type !== 'string' || it.type.trim().length === 0) {
-        throw new Error(`items[${idx}] ("${it.name}"): "type" is required`);
-      }
-      if (validTypes && !validTypes.includes(it.type)) {
-        throw new Error(
-          `items[${idx}] ("${it.name}"): unknown type "${it.type}" for system "${(game.system as any)?.id}". ` +
-            `Valid Item types: ${validTypes.join(', ')}`
-        );
-      }
-
-      const doc: Record<string, any> = { name: it.name, type: it.type };
-      if (it.img) doc.img = it.img;
-      if (it.system && typeof it.system === 'object') doc.system = it.system;
-      return doc;
-    });
+    const { docs: payload, requested, labels } = await this.buildItemDocs(items);
+    assertChoicesAnswered(payload, labels);
 
     try {
-      const created = await actor.createEmbeddedDocuments('Item', payload);
+      const created = await actor.createEmbeddedDocuments('Item', payload, { keepId: true });
 
       const result = {
         actorId: actor.id,
         actorName: actor.name,
-        created: (created || []).map((doc: any) => ({
-          id: doc.id,
-          name: doc.name,
-          type: doc.type,
-        })),
+        created: summarizeRequested(created, requested),
       };
 
       this.auditLog(
@@ -5502,18 +5727,10 @@ export class FoundryDataAccess {
    * Items sidebar and can be dragged onto any actor sheet. Optionally places
    * items inside a named/id-resolved folder, creating the folder if necessary.
    */
-  async createWorldItems(params: {
-    items: Array<{
-      name: string;
-      type: string;
-      img?: string;
-      system?: Record<string, any>;
-    }>;
-    folder?: string;
-  }): Promise<{
+  async createWorldItems(params: { items: ItemEntryInput[]; folder?: string }): Promise<{
     folderId: string | null;
     folderName: string | null;
-    created: Array<{ id: string; name: string; type: string }>;
+    created: Array<{ id: string; name: string; type: string; sourceUuid?: string }>;
   }> {
     this.validateFoundryState();
 
@@ -5523,31 +5740,8 @@ export class FoundryDataAccess {
       throw new Error('items array is required and must contain at least one entry');
     }
 
-    const itemDocTypes = (game as any).system?.documentTypes?.Item;
-    const validTypes: string[] | null =
-      itemDocTypes && typeof itemDocTypes === 'object' ? Object.keys(itemDocTypes) : null;
-
-    const payload = items.map((it, idx) => {
-      if (!it || typeof it.name !== 'string' || it.name.trim().length === 0) {
-        throw new Error(`items[${idx}]: "name" is required and must be a non-empty string`);
-      }
-      if (typeof it.type !== 'string' || it.type.trim().length === 0) {
-        throw new Error(`items[${idx}] ("${it.name}"): "type" is required`);
-      }
-      if (validTypes && !validTypes.includes(it.type)) {
-        throw new Error(
-          `items[${idx}] ("${it.name}"): unknown type "${it.type}" for system "${(game.system as any)?.id}". ` +
-            `Valid Item types: ${validTypes.join(', ')}`
-        );
-      }
-
-      const doc: Record<string, any> = { name: it.name, type: it.type };
-      if (it.img) doc.img = it.img;
-      if (it.system && typeof it.system === 'object') doc.system = it.system;
-      if (Array.isArray((it as any).effects)) doc.effects = (it as any).effects;
-      if ((it as any).flags && typeof (it as any).flags === 'object') doc.flags = (it as any).flags;
-      return doc;
-    });
+    // No unanswered-choice check: ChoiceSets only prompt when embedded on an actor.
+    const { docs: payload, requested } = await this.buildItemDocs(items);
 
     // Resolve or create the target folder
     let folderDoc: any = null;
@@ -5572,16 +5766,12 @@ export class FoundryDataAccess {
     }
 
     try {
-      const created = await (Item as any).createDocuments(payload);
+      const created = await (Item as any).createDocuments(payload, { keepId: true });
 
       const result = {
         folderId: folderDoc ? folderDoc.id : null,
         folderName: folderDoc ? folderDoc.name : null,
-        created: (created || []).map((doc: any) => ({
-          id: doc.id,
-          name: doc.name,
-          type: doc.type,
-        })),
+        created: summarizeRequested(created, requested),
       };
 
       this.auditLog(
