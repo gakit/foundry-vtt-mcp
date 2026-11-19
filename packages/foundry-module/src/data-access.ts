@@ -164,7 +164,7 @@ function staticChoiceValues(choices: unknown): unknown[] | null {
   }
 
   return choices.map(choice =>
-    choice !== null && typeof choice === 'object' ? (choice as any).value : choice
+    choice !== null && typeof choice === 'object' ? choice.value : choice
   );
 }
 
@@ -229,10 +229,11 @@ function assertChoicesAnswered(docs: Record<string, any>[], labels: string[]): v
     return;
   }
 
+  const retryHint =
+    'Retry with "selections": { "<key>": <value> } on each item ' +
+    '(inline items: set system.rules[n].selection)';
   throw new Error(
-    'Unanswered ChoiceSet choices; nothing was created. Retry with "selections": { "<key>": <value> } ' +
-      'on each item (inline items: set system.rules[n].selection):\n' +
-      lines.join('\n')
+    `Unanswered ChoiceSet choices; nothing was created. ${retryHint}:\n${lines.join('\n')}`
   );
 }
 
