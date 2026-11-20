@@ -248,13 +248,16 @@ function summarizeRequested(
   return (created || [])
     .filter((doc: any) => requested.has(doc.id))
     .map((doc: any) => {
-      const sourceUuid = requested.get(doc.id);
-      return {
+      const summary: { id: string; name: string; type: string; sourceUuid?: string } = {
         id: doc.id,
         name: doc.name,
         type: doc.type,
-        ...(sourceUuid ? { sourceUuid } : {}),
       };
+      const sourceUuid = requested.get(doc.id);
+      if (sourceUuid) {
+        summary.sourceUuid = sourceUuid;
+      }
+      return summary;
     });
 }
 
@@ -3062,32 +3065,32 @@ export class FoundryDataAccess {
           );
 
           // Convert to CompendiumSearchResult format
-          return filteredResults.map(
-            creature =>
-              ({
-                id: creature.id || creature.name,
-                ...(creature.id
-                  ? { uuid: compendiumEntryUuid(creature.pack, 'Actor', creature.id) }
-                  : {}),
-                name: creature.name,
-                type: creature.type || 'npc',
-                pack: creature.pack,
-                packLabel: creature.packLabel || creature.pack,
-                description: creature.description || '',
-                hasImage: creature.hasImage || !!creature.img,
-                summary: `CR ${creature.challengeRating} ${creature.creatureType} from ${creature.packLabel}`,
-                // Enhanced data (not part of interface but will be included)
-                challengeRating: creature.challengeRating,
-                creatureType: creature.creatureType,
-                size: creature.size,
-                hasLegendaryActions: creature.hasLegendaryActions,
-              }) as CompendiumSearchResult & {
-                challengeRating: number;
-                creatureType: string;
-                size: string;
-                hasLegendaryActions: boolean;
-              }
-          );
+          return filteredResults.map(creature => {
+            const result = {
+              id: creature.id || creature.name,
+              name: creature.name,
+              type: creature.type || 'npc',
+              pack: creature.pack,
+              packLabel: creature.packLabel || creature.pack,
+              description: creature.description || '',
+              hasImage: creature.hasImage || !!creature.img,
+              summary: `CR ${creature.challengeRating} ${creature.creatureType} from ${creature.packLabel}`,
+              // Enhanced data (not part of interface but will be included)
+              challengeRating: creature.challengeRating,
+              creatureType: creature.creatureType,
+              size: creature.size,
+              hasLegendaryActions: creature.hasLegendaryActions,
+            } as CompendiumSearchResult & {
+              challengeRating: number;
+              creatureType: string;
+              size: string;
+              hasLegendaryActions: boolean;
+            };
+            if (creature.id) {
+              result.uuid = compendiumEntryUuid(creature.pack, 'Actor', creature.id);
+            }
+            return result;
+          });
         } catch (error) {
           console.warn(
             `[${this.moduleId}] Enhanced search failed, falling back to basic search:`,
@@ -3208,17 +3211,8 @@ export class FoundryDataAccess {
               }
 
               // Standard index entry result
-              results.push({
+              const result: CompendiumSearchResult = {
                 id: typedEntry._id || '',
-                ...(typedEntry._id
-                  ? {
-                      uuid: compendiumEntryUuid(
-                        pack.metadata.id,
-                        pack.metadata.type,
-                        typedEntry._id
-                      ),
-                    }
-                  : {}),
                 name: typedEntry.name,
                 type: typedEntry.type || 'unknown',
                 img: typedEntry.img || undefined,
@@ -3227,7 +3221,15 @@ export class FoundryDataAccess {
                 description: typedEntry.description || '',
                 hasImage: !!typedEntry.img,
                 summary: `${typedEntry.type} from ${pack.metadata.label}`,
-              });
+              };
+              if (typedEntry._id) {
+                result.uuid = compendiumEntryUuid(
+                  pack.metadata.id,
+                  pack.metadata.type,
+                  typedEntry._id
+                );
+              }
+              results.push(result);
             }
           } catch (entryError) {
             // Log individual entry errors but continue processing
