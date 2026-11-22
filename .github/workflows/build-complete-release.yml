@@ -490,8 +490,7 @@ jobs:
           - Manual Claude Desktop configuration required
 
           **Foundry VTT Users:**
-          - Install directly from Foundry's module browser
-          - Or use manifest: `https://github.com/adambdooley/foundry-vtt-mcp/releases/latest/download/module.json`
+          - Install with this manifest URL (fork build, not on Foundry's module browser): `https://github.com/gakit/foundry-vtt-mcp/releases/latest/download/module.json`
 
           ### Quick Start
           1. Choose your installation method above
@@ -534,6 +533,8 @@ jobs:
         prerelease: false
 
     - name: Update Foundry VTT Package Registry
+      # The registry entry belongs to the upstream package; a fork release must not touch it.
+      if: github.repository == 'adambdooley/foundry-vtt-mcp'
       run: |
         echo "🔄 Updating Foundry VTT Package Registry..."
 
